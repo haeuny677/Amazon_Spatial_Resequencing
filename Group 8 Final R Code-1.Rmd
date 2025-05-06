@@ -1,0 +1,634 @@
+---
+title: "APAN 5025 Group 8 Final R Code"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    collapsed: false
+    number_sections: true
+---
+# Set up
+```{r}
+# All of libraries 
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+library(psych)
+library(tidyverse)
+library(lubridate)
+library(gridExtra)
+library(broom)
+library(ggmap)
+library(ggrepel)
+library(forcats)
+library(dbscan)
+library(RColorBrewer)
+library(kableExtra)
+library(geosphere)
+library(TSP)
+
+# Google Key
+register_google(key = "AIzaSyD2H7Xy0yI1hEONVTzQciE-D5cRFSlOIZw")
+
+# knitr options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Principal Component Analysis (PCA)
+## Data Preparation
+```{r}
+# Read and subset data
+amazondata <- read.csv("/Users/Louie/Desktop/cleaned_dataset.csv")
+
+selected_vars <- c("PackageVolume_cm3", "ExecutorCapacity", "LoadUtilization", 
+                   "PlannedServiceTime", "DeliveryDuration_HR", "DistanceToNextStop")
+
+# Remove missing values and scale the selected features
+amazon_pca_data <- amazondata %>%
+  select(all_of(selected_vars)) %>%
+  na.omit() %>%
+  scale()
+
+# Subsample 8000 rows for computational efficiency
+set.seed(123)
+amazon_subset <- as.data.frame(amazon_pca_data) %>% sample_n(8000)
+```
+
+## Suitability Check for PCA
+```{r}
+# Correlation matrix
+cor_matrix <- cor(amazon_subset)
+
+# KMO Test
+kmo_result <- KMO(cor_matrix)
+kmo_result
+
+# Bartlett's Test
+bartlett_test <- cortest.bartlett(cor_matrix, n = nrow(amazon_subset))
+bartlett_test
+```
+
+## Run PCA
+```{r}
+# Run PCA
+pca_result <- prcomp(amazon_subset, center = TRUE, scale. = TRUE)
+
+# Variance explained
+summary(pca_result)
+
+# Scree plot
+fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 50))
+```
+
+## View Loadings For Top 5 Principal Components
+```{r}
+# Loadings for top 5 PCs
+round(pca_result$rotation[, 1:5], 3)
+```
+
+## Visualize PCA Individuals
+```{r}
+# PCA individuals plot
+fviz_pca_ind(pca_result,
+             geom.ind = "point",
+             col.ind = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE)
+```
+
+## Determine Optimal K for Clustering
+```{r}
+# Extract first three principal components
+pca_df <- as.data.frame(pca_result$x[, 1:3])
+
+# Calculate WSS and Ratio
+within_ss = sapply(1:9, FUN = function(x) kmeans(pca_df, centers = x, iter.max = 100)$tot.withinss)
+ratio_ss = sapply(1:9, FUN = function(x) {
+  km = kmeans(pca_df, centers = x, iter.max = 100)
+  ratio = km$betweenss/km$totss
+  return(ratio)
+})
+
+# Combine into a dataframe
+dat = data.frame(clusters = 1:9, within_ss, ratio_ss)
+
+# Ratio Plot
+ggplot(dat, aes(x = clusters, y = ratio_ss)) +
+  geom_line(color = 'steelblue', linewidth = 1.4) +
+  scale_x_continuous(breaks = 1:9) +
+  geom_vline(xintercept = 3, linetype = 2) +
+  labs(title = "Ratio of Between to Total SS", x = "Number of Clusters", y = "Ratio")
+```
+
+## K-Means Clustering with K = 3
+```{r}
+# Run K-Means
+set.seed(123)
+kmeans_result <- kmeans(pca_df, centers = 3, nstart = 25)
+pca_df$cluster <- factor(kmeans_result$cluster)
+
+# Clustered PCA scatter plot
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(title = "K-Means Clustering based on PCA", x = "PC1", y = "PC2") +
+  theme_minimal()
+```
+
+## Interpretation of Clusters
+```{r}
+# Interpretation of clusters
+pca_scores <- as.data.frame(pca_result$x[, 1:3])
+pca_scores$Cluster <- as.factor(kmeans_result$cluster)
+
+aggregate(. ~ Cluster, data = pca_scores, mean)
+```
+
+# Load Utilization
+## Load Data and Preprocessing
+```{r}
+# Load Data
+amazondata <- read.csv("/Users/Louie/Desktop/cleaned_dataset.csv")
+
+# Select relevant fields & Convert PlannedServiceTime to numeric if not already
+load_data <- amazondata %>%
+  select(RouteID, StationCode, PackageID, LoadUtilization, DeliveryDuration_HR, PlannedServiceTime) %>%
+  drop_na() %>%
+  mutate(PlannedServiceTime = as.numeric(PlannedServiceTime))
+```
+
+## Feature Enrichment
+```{r}
+# Total packages per Route
+route_total_packages <- load_data %>%
+  group_by(RouteID) %>%
+  summarise(TotalPackages = n(), .groups = 'drop')
+
+# Packages Delivered at Each Stop
+packages_per_stop <- load_data %>%
+  group_by(RouteID, StationCode) %>%
+  summarise(
+    PackagesAtStop     = n(),
+    PlannedServiceTime = min(PlannedServiceTime),
+    .groups            = 'drop'
+  )
+
+# Remaining Packages
+packages_ordered <- packages_per_stop %>%
+  arrange(RouteID, PlannedServiceTime) %>%
+  group_by(RouteID) %>%
+  mutate(
+    RemainingPackages = rev(cumsum(rev(PackagesAtStop))),
+    StopOrder         = row_number()
+  ) %>%
+  ungroup()
+
+head(packages_ordered)
+
+```
+
+## Visualize the New Features
+```{r}
+# Packages Delivered
+p1 <- ggplot(packages_ordered, aes(x = PackagesAtStop)) +
+  geom_histogram(binwidth = 1, fill = 'steelblue', color = 'white', alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Correct: Distribution of Packages Delivered at Each Stop",
+    x     = "Packages Delivered",
+    y     = "Count"
+  )
+
+# Remaining Packages
+p2 <- ggplot(packages_ordered, aes(x = RemainingPackages)) +
+  geom_histogram(binwidth = 5, fill = 'darkgreen', color = 'white', alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Fixed: Remaining Packages Distribution",
+    x     = "Remaining Packages",
+    y     = "Count"
+  )
+
+p1
+p2
+
+```
+
+## Merge Features for Regression Analysis
+```{r}
+load_data_full <- load_data %>%
+  left_join(
+    packages_ordered %>% select(RouteID, StationCode, PackagesAtStop, RemainingPackages),
+    by = c("RouteID", "StationCode")
+  ) %>%
+  drop_na()
+
+```
+
+## Regression Modeling
+```{r}
+reg_model <- lm(DeliveryDuration_HR ~ LoadUtilization + PackagesAtStop, data = load_data_full)
+summary(reg_model)
+tidy(reg_model)
+```
+
+# Spacial Analysis
+## Data Loading & Initial Cleaning
+```{r}
+# Load & Prepare Data
+spatial_data <- read.csv("/Users/Louie/Desktop/cleaned_dataset.csv") %>%
+  drop_na(Latitude, Longitude, DeliveryDuration_HR, PlannedServiceTime) %>%
+  mutate(
+    DeliveryDelay_HR = as.numeric(
+      difftime(as.POSIXct(EndTimeUTC), as.POSIXct(StartTimeUTC), units = "hours")
+    ) - (PlannedServiceTime / 3600),
+    DeliveryHour   = hour(as.POSIXct(StartTimeUTC)),
+    DeliveryPeriod = case_when(
+      DeliveryHour < 12 ~ "Morning",
+      DeliveryHour < 18 ~ "Afternoon",
+      TRUE             ~ "Evening"
+    )
+  )
+```
+
+## Define Focus Cities
+```{r}
+cities <- tibble(
+  city = c("Los Angeles", "Seattle", "Boston", "Austin", "Chicago"),
+  lon  = c(-118.25,      -122.33,    -71.06,    -97.74,   -87.63),
+  lat  = c(34.05,         47.61,      42.36,     30.27,    41.88)
+)
+```
+
+## City‐level Hotspot Plots
+```{r}
+plot_city_hotspots <- function(df, city_name, center_lon, center_lat,
+                               extent = 0.5, zoom = 10) {
+  sub <- df %>%
+    filter(
+      Longitude >= center_lon - extent,
+      Longitude <= center_lon + extent,
+      Latitude  >= center_lat - extent,
+      Latitude  <= center_lat + extent
+    )
+  if (nrow(sub) == 0) stop("No data for ", city_name)
+  
+  bbox <- c(
+    left   = center_lon - extent,
+    bottom = center_lat - extent,
+    right  = center_lon + extent,
+    top    = center_lat + extent
+  )
+  base_map <- get_map(location = bbox, source = "google", maptype = "roadmap", zoom = zoom)
+  
+  ggmap(base_map) +
+    geom_point(
+      data = sub,
+      aes(x = Longitude, y = Latitude,
+          color = pmin(pmax(DeliveryDelay_HR, 0), 5)),
+      size = 0.5, alpha = 0.7
+    ) +
+    scale_color_gradientn(
+      colors = rev(brewer.pal(11, "RdYlGn")),
+      limits = c(0, 5),
+      name   = "Delay (hrs)"
+    ) +
+    labs(
+      title    = paste(city_name, "Delivery Hotspots"),
+      subtitle = "Stops colored by delay (0–5 hrs)"
+    ) +
+    theme_minimal()
+}
+
+# generate and print hotspot maps for each city
+for (i in seq_len(nrow(cities))) {
+  print(
+    plot_city_hotspots(
+      spatial_data,
+      cities$city[i],
+      cities$lon[i],
+      cities$lat[i]
+    )
+  )
+}
+```
+
+
+## Identify Top-20 Clusters via DBSCAN
+```{r}
+# Extract coordinates & run DBSCAN clustering
+coords <- spatial_data %>%
+  select(Longitude, Latitude) %>%
+  mutate(
+    Longitude = as.numeric(Longitude),
+    Latitude  = as.numeric(Latitude)
+  ) %>%
+  data.matrix()
+
+# Run DBSCAN with eps = 0.05, minPts = 30
+set.seed(42)
+db <- dbscan::dbscan(coords, eps = 0.05, minPts = 30)
+
+# Assign cluster labels
+spatial_data$Cluster <- factor(db$cluster)
+
+# Summarize top-20 clusters by delivery count
+cluster_summary <- spatial_data %>%
+  filter(Cluster != "0") %>%
+  group_by(Cluster) %>%
+  summarise(
+    DeliveryCount = n(),
+    Lon           = mean(Longitude),
+    Lat           = mean(Latitude),
+    .groups       = "drop"
+  ) %>%
+  arrange(desc(DeliveryCount)) %>%
+  slice(1:20) %>%
+  mutate(ClusterRank = row_number())
+
+write.csv(spatial_data, "/Users/Louie/Desktop/spatial_clustered_nationally.csv", row.names = FALSE)
+```
+
+## Join Cluster Ranks & Build Color Palette
+```{r}
+spatial_data <- spatial_data %>%
+  left_join(cluster_summary %>% select(Cluster, ClusterRank), by = "Cluster") %>%
+  filter(!is.na(ClusterRank))
+
+cluster_palette <- colorRampPalette(brewer.pal(11, "RdYlGn"))(20)
+```
+
+## Nationwide Map of Top-20 Clusters
+```{r}
+# Use US map centered on the continental US for a broad view
+us_map <- get_map(location = c(-98, 39), zoom = 4, scale = 2, source = "google")
+
+# Plot the map and overlay our top-20 delivery clusters
+ggmap(us_map) +
+  geom_point(
+    data  = cluster_summary,
+    aes(x = Lon, y = Lat, size = DeliveryCount, color = factor(ClusterRank)),
+    alpha = 0.7
+  ) +
+  geom_label_repel(
+    data = cluster_summary,
+    aes(x = Lon, y = Lat, label = ClusterRank),
+    size = 3, box.padding = 0.3
+  ) +
+  scale_color_manual(name = "Cluster Rank", values = cluster_palette) +
+  scale_size(range = c(2, 10)) +
+  theme_minimal() +
+  labs(title = "Top 20 Delivery Clusters Across the US")
+```
+
+## Delay Composition per Cluster
+```{r}
+# Categorize each delivery stop’s delay into On Time / Slight / Moderate / Severe
+spatial_data <- spatial_data %>%
+  mutate(
+    DelayCategory = factor(
+      case_when(
+        DeliveryDelay_HR <= 0 ~ "On Time",
+        DeliveryDelay_HR <= 1 ~ "Slight",
+        DeliveryDelay_HR <= 5 ~ "Moderate",
+        TRUE                 ~ "Severe"
+      ),
+      levels = c("On Time", "Slight", "Moderate", "Severe")
+    )
+  )
+
+# Calculate counts and share of each delay category within each cluster rank
+delay_by_cluster <- spatial_data %>%
+  group_by(ClusterRank, DelayCategory) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(ClusterRank) %>%
+  mutate(share = n / sum(n))
+
+# Order clusters by their “On Time” share (descending)
+on_time_order <- delay_by_cluster %>%
+  filter(DelayCategory == "On Time") %>%
+  arrange(desc(share)) %>%
+  pull(ClusterRank)
+
+# Plot a 100% stacked bar chart of delay composition, ordered by on-time performance
+ggplot(delay_by_cluster, aes(
+  x    = factor(ClusterRank, levels = on_time_order),
+  y    = share,
+  fill = DelayCategory
+)) +
+  geom_col(position = "fill", color = "white") +
+  scale_fill_brewer(name = "Delay Category", palette = "RdYlGn", direction = -1) +
+  theme_minimal() +
+  labs(
+    title = "Delay Composition per Cluster (Ordered by “On Time” Share)",
+    x     = "Cluster Rank",
+    y     = "Proportion of Deliveries"
+  )
+```
+
+## Average Delivery Delay by Time Period
+```{r}
+# Compute the average delivery delay for each cluster by time period
+delay_period <- spatial_data %>%
+  group_by(ClusterRank, DeliveryPeriod) %>%
+  summarise(AvgDelay = mean(DeliveryDelay_HR, na.rm = TRUE), .groups = "drop")
+
+# Plot average delivery delay by time period, side-by-side for each cluster
+ggplot(delay_period, aes(x = factor(ClusterRank), y = AvgDelay, fill = DeliveryPeriod)) +
+  geom_col(position = "dodge") +
+  theme_minimal() +
+  labs(
+    title = "Average Delivery Delay by Time Period",
+    x     = "Cluster Rank",
+    y     = "Avg Delay (hrs)"
+  )
+```
+
+## Load Utilization Distribution by Cluster
+```{r}
+ggplot(spatial_data, aes(x = factor(ClusterRank), y = LoadUtilization)) +
+  geom_violin(fill = "lightblue", color = "black", alpha = 0.6) +
+  geom_jitter(width = 0.2, alpha = 0.2, size = 0.5) +
+  theme_minimal() +
+  labs(
+    title = "Load Utilization by Cluster",
+    x     = "Cluster Rank",
+    y     = "Load Utilization (1–6)"
+  )
+```
+
+## Cluster-Level Risk Scoring & Summary Table
+```{r}
+# Summarize key metrics for each of the top clusters
+cluster_profile <- spatial_data %>%
+  filter(Cluster %in% cluster_summary$Cluster) %>%
+  group_by(Cluster) %>%
+  summarise(
+    Orders     = n(),
+    AvgDelay   = mean(DeliveryDelay_HR, na.rm = TRUE),
+    SeverePct  = mean(DelayCategory == "Severe"),
+    AvgUtil    = mean(LoadUtilization, na.rm = TRUE),
+    Efficiency = mean(DistanceToNextStop / DeliveryDuration_HR, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    DelayScore = ntile(AvgDelay, 5),
+    UtilScore  = 6 - ntile(AvgUtil, 5),
+    EffScore   = 6 - ntile(Efficiency, 5),
+    RiskScore  = DelayScore + UtilScore + EffScore,
+    RiskLevel  = case_when(
+      RiskScore >= 13 ~ "🔴 High Risk",
+      RiskScore >= 10 ~ "🟠 Moderate Risk",
+      TRUE            ~ "🟢 Low Risk"
+    )
+  ) %>%
+  arrange(desc(RiskScore))
+
+# Render the cluster-level risk table with styling
+cluster_profile %>%
+  kbl(caption = "Cluster-Level Risk Table (Quantile-Based Scoring)") %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(0, bold = TRUE) %>%
+  column_spec(7, color = "white", background = "#FF6961")
+```
+
+## System-Wide Delivery Delay & Load Utilization Distributions
+```{r}
+# Plot the overall distribution of delivery delays across all stops
+ggplot(spatial_data, aes(x = DeliveryDelay_HR)) +
+  geom_density(fill = "lightcoral", alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Overall Distribution of Delivery Delay (Hours)")
+
+# Plot the overall distribution of load utilization across all stops
+ggplot(spatial_data, aes(x = LoadUtilization)) +
+  geom_density(fill = "skyblue", alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Overall Distribution of Load Utilization")
+```
+
+# Resequencing
+## Load & Prepare Data
+```{r}
+spatial_data <- read.csv("/Users/Louie/Desktop/spatial_clustered_nationally.csv") %>%
+  drop_na(Latitude, Longitude, LoadUtilization, DeliveryPeriod)
+
+spatial_data <- spatial_data %>%
+  mutate(DeliveryPeriod = str_extract(DeliveryPeriod, "Morning|Afternoon|Evening")) %>%
+  mutate(TimePenalty = case_when(
+    DeliveryPeriod == "Morning" ~ 1.5,
+    DeliveryPeriod == "Afternoon" ~ 1.2,
+    DeliveryPeriod == "Evening" ~ 1.0,
+    TRUE ~ 1.0
+  ))
+```
+
+## Define Weighted TSP Optimization Function
+```{r}
+optimize_weighted_tsp <- function(df) {
+  coords <- df %>% select(Longitude, Latitude)
+  dist_matrix <- distm(coords)
+  weights <- df$TimePenalty / df$LoadUtilization
+  weight_matrix <- outer(weights, weights, FUN = function(a, b) (a + b) / 2)
+
+  if (!all(dim(dist_matrix) == dim(weight_matrix))) {
+    stop("Weight matrix and distance matrix dimensions do not match.")
+  }
+# Apply the weights to the distance matrix
+  dist_matrix <- dist_matrix * weight_matrix
+  tsp <- TSP(as.dist(dist_matrix))
+  route <- solve_TSP(tsp)
+  df$OptimizedOrder <- match(seq_along(route), as.integer(route))
+  return(df)
+}
+```
+
+## Compute Total Route Distance Helper
+```{r}
+compute_total_distance <- function(df) {
+  df <- df %>% arrange(OptimizedOrder)
+  coords <- df %>% select(Longitude, Latitude)
+  sum(distHaversine(coords[-nrow(coords), ], coords[-1, ]))
+}
+```
+
+## Plotting Function for Cluster Routes
+```{r}
+# Function to plot original, TSP, and weighted-TSP routes for a given cluster
+plot_cluster_routes <- function(cluster_id, max_n = 100) {
+  cluster_df <- spatial_data %>%
+  filter(Cluster == cluster_id,
+         !is.na(TimePenalty),
+         !is.na(LoadUtilization),
+         LoadUtilization > 0) %>%
+  slice_sample(n = max_n)
+
+
+  coords <- cluster_df %>% select(Longitude, Latitude)
+  dist_matrix <- distm(coords)
+
+  tsp <- TSP(as.dist(dist_matrix))
+  tsp_route <- solve_TSP(tsp)
+  tsp_df <- cluster_df %>%
+    mutate(OptimizedOrder = match(seq_along(tsp_route), as.integer(tsp_route)),
+           Method = "TSP")
+
+  weighted_df <- optimize_weighted_tsp(cluster_df) %>%
+    mutate(Method = "Weighted TSP")
+
+  base_df <- cluster_df %>%
+    mutate(OptimizedOrder = row_number(),
+           Method = "Original")
+
+  combined <- bind_rows(base_df, tsp_df, weighted_df)
+
+  plots <- list()
+  distances <- list()
+# Loop over each method to compute distances and generate maps
+  for (method in c("Original", "TSP", "Weighted TSP")) {
+    subset <- combined %>% filter(Method == method)
+    dist <- compute_total_distance(subset)
+    distances[[method]] <- dist
+
+    p <- tryCatch({
+      qmplot(Longitude, Latitude,
+             data = subset %>% arrange(OptimizedOrder),
+             maptype = "roadmap", zoom = 11, colour = OptimizedOrder,
+             source = "google") +
+        geom_path(aes(group = 1),
+                  color = ifelse(method == "TSP", "red",
+                                 ifelse(method == "Weighted TSP", "green", "blue")),
+                  size = 2.0, alpha = 0.9) +
+        geom_point(data = subset %>% filter(OptimizedOrder == 1),
+                   aes(x = Longitude, y = Latitude),
+                   color = "black", shape = 17, size = 4) +
+        geom_point(data = subset %>% filter(OptimizedOrder == max(OptimizedOrder)),
+                   aes(x = Longitude, y = Latitude),
+                   color = "black", shape = 8, size = 4) +
+        ggtitle(paste("Cluster", cluster_id, "-", method,
+                      sprintf("(%.1f km)", dist / 1000)))
+    }, error = function(e) {
+      message("Map rendering failed for method ", method, ": ", e$message)
+      ggplot() + ggtitle(paste("Error in", method))
+    })
+
+    plots[[method]] <- p
+  }
+# Arrange and display the three method plots vertically
+  grid.arrange(grobs = plots, ncol = 1)
+}
+
+```
+
+## Optimization Results for Cluster 1
+```{r plot-cluster1, fig.height=12}
+plot_cluster_routes(1)
+```
+
+## Optimization Results for Cluster 17
+```{r plot-cluster17, fig.height=12}
+plot_cluster_routes(17)
+```
+
