@@ -1,5 +1,5 @@
 ---
-title: "APAN 5025 Group 8 Working R code for Analysis"
+title: "Working R code for Analysis"
 output:
   html_document:
     toc: true
